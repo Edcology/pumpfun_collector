@@ -4,3 +4,5 @@ collector.db
 __pycache__/
 *.pyc
 logs/
+Procfile
+render.yaml
