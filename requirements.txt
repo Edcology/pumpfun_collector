@@ -1,0 +1,6 @@
+websockets
+aiohttp
+sqlalchemy
+aiosqlite
+python-dotenv
+schedule

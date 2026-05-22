@@ -1,0 +1,6 @@
+.env
+venv/
+collector.db
+__pycache__/
+*.pyc
+logs/
