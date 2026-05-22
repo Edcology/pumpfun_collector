@@ -1,7 +1,6 @@
     # backfill.py
 import asyncio
 import aiohttp
-import schedule
 import time
 import threading
 from datetime import datetime, timezone
@@ -176,19 +175,7 @@ async def run_backfill():
         await asyncio.gather(*tasks)
 
     logger.info("[BACKFILL] Run complete.")
-def run_backfill_sync():
-    """Called by schedule — bridges sync scheduler to async."""
-    asyncio.run(run_backfill())
-# ------------------------------------------------------------------
-# Scheduler — runs in a background thread so it doesn't block main
-# ------------------------------------------------------------------
-def start_scheduler():
-    schedule.every(6).hours.do(run_backfill_sync)
-    # Also run immediately on startup
-    run_backfill_sync()
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+
 if __name__ == "__main__":
     # Run standalone for manual backfill
     asyncio.run(run_backfill())
