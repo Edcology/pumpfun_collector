@@ -109,6 +109,22 @@ async def backfill_token(
         mint       = token["mint"]
         db_id      = token["id"]
         created_at = token["watch_started_at"]
+        if isinstance(created_at, str):
+            # Handle both formats SQLite might return
+            created_at = created_at.replace("Z", "+00:00")
+            try:
+                created_at = datetime.fromisoformat(created_at)
+            except ValueError:
+                # Fallback for format without timezone
+                created_at = datetime.strptime(
+                    created_at[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+
+        if created_at is None:
+            logger.warning(f"[SKIP] {mint[:8]} — no watch_started_at")
+            return
+
+        trades = await fetch_ohlcv(session, mint, created_at)
         trades = await fetch_ohlcv(session, mint, created_at)
         # Get entry price from first candle open
         entry_price = 0
