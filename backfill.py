@@ -1,197 +1,170 @@
-    # backfill.py
+import sys
 import asyncio
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import aiohttp
-import time
-import threading
-from datetime import datetime, timezone
-from database.db import engine
+from datetime import datetime as dt, timezone
+
 from sqlalchemy import text
+
+from database.db import engine
 from utils.logger import logger
-BITQUERY_API_KEY = "ef87e84b-f641-4379-b8be-065aec1de1a1"
-BITQUERY_URL     = "https://streaming.bitquery.io/graphql"
-CONCURRENCY      = 3
-TARGET_MULTIPLIER = 2.0
-# ------------------------------------------------------------------
-# Bitquery — fetch OHLCV for a token's first 24h
-# ------------------------------------------------------------------
-OHLCV_QUERY = """
-query ($mint: String!, $from: ISO8601DateTime!, $till: ISO8601DateTime!) {
-solana(network: solana) {
-    dexTrades(
-    baseCurrency: {is: $mint}
-    date: {between: [$from, $till]}
-    options: {asc: "timeInterval.minute", limit: 1440}
-    ) {
-    timeInterval {
-        minute(count: 1)
-    }
-    high: quotePrice(calculate: maximum)
-    low:  quotePrice(calculate: minimum)
-    open: minimum(of: block, get: quote_price)
-    close: maximum(of: block, get: quote_price)
-    volume: quoteAmount
-    }
-}
-}
-"""
-async def fetch_ohlcv(
-    session: aiohttp.ClientSession,
-    mint: str,
-    created_at: datetime,
-) -> dict | None:
-    from_dt = created_at.strftime("%Y-%m-%dT%H:%M:%S")
-    # 24h window
-    import datetime as dt
-    till_dt = (created_at + dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
-    headers = {
-        "Content-Type":  "application/json",
-        "X-API-KEY":     BITQUERY_API_KEY,
-    }
-    payload = {
-        "query":     OHLCV_QUERY,
-        "variables": {"mint": mint, "from": from_dt, "till": till_dt},
-    }
+
+# ─────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────
+
+GT_BASE      = "https://api.geckoterminal.com/api/v2"
+GT_HEADERS   = {"Accept": "application/json;version=20230302"}
+GT_CALL_DELAY = 20.0
+
+PEAK_WINDOW_SECS = 3600
+
+
+# ─────────────────────────────────────────────────────────────
+# DB
+# ─────────────────────────────────────────────────────────────
+
+async def write_result(db_id, entry, peak, multiplier, hit_2x):
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("""
+                UPDATE token_snapshots
+                SET
+                    entry_price_sol = :entry,
+                    peak_price_sol  = :peak,
+                    peak_multiplier = :multiplier,
+                    hit_2x          = :hit_2x,
+                    watch_ended_at  = :ended
+                WHERE id = :id
+            """),
+            {
+                "id":         db_id,
+                "entry":      entry,
+                "peak":       peak,
+                "multiplier": multiplier,
+                "hit_2x":     hit_2x,
+                "ended":      dt.now(timezone.utc),
+            },
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# GeckoTerminal
+# ─────────────────────────────────────────────────────────────
+
+async def get_pool(session, mint):
     try:
-        async with session.post(
-            BITQUERY_URL,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+        async with session.get(
+            f"{GT_BASE}/networks/solana/tokens/{mint}/pools",
+            params={"page": 1},
+            timeout=aiohttp.ClientTimeout(total=10),
         ) as r:
             if r.status != 200:
-                logger.debug(f"Bitquery HTTP {r.status} for {mint[:8]}")
-                return None
-            data = await r.json()
-            trades = (
-                data.get("data", {})
-                    .get("solana", {})
-                    .get("dexTrades", [])
-            )
-            return trades if trades else None
+                return None, None
+            data = (await r.json()).get("data", [])
+            if not data:
+                return None, None
+            best        = max(data, key=lambda p: float(p["attributes"].get("reserve_in_usd") or 0))
+            addr        = best["attributes"]["address"]
+            base_id     = best.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
+            token_param = "base" if mint in base_id else "quote"
+            return addr, token_param
     except Exception as e:
-        logger.debug(f"Bitquery fetch failed [{mint[:8]}]: {e}")
-        return None
-def compute_outcome(trades: list, entry_price: float) -> dict:
-    if not trades or entry_price == 0:
-        return {
-            "hit_2x":          False,
-            "rug_detected":    True,
-            "peak_price_sol":  entry_price,
-            "peak_multiplier": 0,
-            "time_to_2x_secs": None,
-        }
-    peak_price     = entry_price
-    time_to_2x     = None
-    elapsed_secs   = 0
-    for candle in trades:
-        high = float(candle.get("high") or 0)
-        elapsed_secs += 60  # 1 candle = 1 minute
-        if high > peak_price:
-            peak_price = high
-        if time_to_2x is None and high >= entry_price * TARGET_MULTIPLIER:
-            time_to_2x = elapsed_secs
-    return {
-        "hit_2x":          time_to_2x is not None,
-        "time_to_2x_secs": time_to_2x,
-        "rug_detected":    peak_price < entry_price * 0.1,  # dropped 90%+
-        "peak_price_sol":  peak_price,
-        "peak_multiplier": round(peak_price / entry_price, 4),
-    }
-# ------------------------------------------------------------------
-# Backfill a single token
-# ------------------------------------------------------------------
-async def backfill_token(
-    semaphore: asyncio.Semaphore,
-    session: aiohttp.ClientSession,
-    token: dict,
-):
-    async with semaphore:
-        mint       = token["mint"]
-        db_id      = token["id"]
-        created_at = token["watch_started_at"]
-        if isinstance(created_at, str):
-            # Handle both formats SQLite might return
-            created_at = created_at.replace("Z", "+00:00")
-            try:
-                created_at = datetime.fromisoformat(created_at)
-            except ValueError:
-                # Fallback for format without timezone
-                created_at = datetime.strptime(
-                    created_at[:19], "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=timezone.utc)
+        logger.warning(f"[GT pool] {mint[:8]} failed: {e}")
+        return None, None
 
-        if created_at is None:
-            logger.warning(f"[SKIP] {mint[:8]} — no watch_started_at")
-            return
 
-        trades = await fetch_ohlcv(session, mint, created_at)
-        trades = await fetch_ohlcv(session, mint, created_at)
-        # Get entry price from first candle open
-        entry_price = 0
-        if trades:
-            entry_price = float(trades[0].get("open") or 0)
-        outcome = compute_outcome(trades, entry_price)
-        async with engine.begin() as conn:
-            await conn.execute(text("""
-                UPDATE token_snapshots SET
-                    entry_price_sol  = :entry,
-                    hit_2x           = :hit_2x,
-                    time_to_2x_secs  = :time_to_2x_secs,
-                    rug_detected     = :rug,
-                    peak_price_sol   = :peak,
-                    peak_multiplier  = :multiplier,
-                    watch_ended_at   = :now
-                WHERE id = :id
-            """), {
-                "id":        db_id,
-                "entry":     entry_price,
-                "hit_2x":    outcome["hit_2x"],
-                "time_to_2x_secs": outcome["time_to_2x_secs"],
-                "rug":       outcome["rug_detected"],
-                "peak":      outcome["peak_price_sol"],
-                "multiplier": outcome["peak_multiplier"],
-                "now":       datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            })
-        logger.info(
-            f"[BACKFILLED] {mint[:8]} | "
-            f"entry={entry_price:.8f} | "
-            f"peak={outcome['peak_multiplier']}x | "
-            f"2x={outcome['hit_2x']} | "
-            f"rug={outcome['rug_detected']}"
-        )
-        await asyncio.sleep(0.3)  # stay under Bitquery rate limit
-# ------------------------------------------------------------------
-# Main backfill job — runs every 6 hours automatically
-# ------------------------------------------------------------------
+async def get_ohlcv(session, pool_address, token_param):
+    try:
+        async with session.get(
+            f"{GT_BASE}/networks/solana/pools/{pool_address}/ohlcv/minute",
+            params={
+                "aggregate": 1,
+                "limit":     100,
+                "currency":  "token",
+                "token":     token_param,
+            },
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            if r.status != 200:
+                return []
+            return (await r.json()).get("data", {}).get("attributes", {}).get("ohlcv_list", [])
+    except Exception as e:
+        logger.warning(f"[GT ohlcv] {pool_address[:8]} failed: {e}")
+        return []
+
+
+def compute_prices(candles):
+    if not candles:
+        return 0.0, 0.0
+    candles = sorted(candles, key=lambda c: c[0])
+    # Use first candle as entry, peak high across first hour
+    launch_ts   = candles[0][0]
+    window      = [c for c in candles if c[0] <= launch_ts + PEAK_WINDOW_SECS]
+    entry_price = float(window[0][1])
+    peak_price  = max(float(c[2]) for c in window)
+    return entry_price, peak_price
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
 async def run_backfill():
-    logger.info("[BACKFILL] Starting scheduled backfill run...")
+    logger.info("[BACKFILL] starting...")
 
     async with engine.connect() as conn:
-        result = await conn.execute(text("""
-            SELECT id, mint, watch_started_at
-            FROM token_snapshots
-            WHERE watch_ended_at IS NULL
-              AND watch_started_at < datetime('now', '-24 hours')
-            ORDER BY watch_started_at ASC
-        """))
-        token_snapshots = [dict(row._mapping) for row in result]
+        result = await conn.execute(
+            text("SELECT id, mint FROM token_snapshots WHERE watch_ended_at IS NULL")
+        )
+        tokens = [dict(row._mapping) for row in result]
 
-    if not token_snapshots:
-        logger.info("[BACKFILL] Nothing to backfill.")
-        return
+    total = len(tokens)
+    logger.info(f"[BACKFILL] {total} tokens to process")
 
-    logger.info(f"[BACKFILL] {len(token_snapshots)} tokens to process...")
+    async with aiohttp.ClientSession(headers=GT_HEADERS) as session:
+        for i, token in enumerate(tokens, 1):
+            mint  = token["mint"]
+            db_id = token["id"]
 
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            backfill_token(semaphore, session, token)
-            for token in token_snapshots
-        ]
-        await asyncio.gather(*tasks)
+            logger.info(f"[{i}/{total}] processing {mint[:8]}")
 
-    logger.info("[BACKFILL] Run complete.")
+            # 1. Pool
+            pool_address, token_param = await get_pool(session, mint)
+            await asyncio.sleep(GT_CALL_DELAY)
+
+            if not pool_address:
+                logger.warning(f"[{i}/{total}] {mint[:8]} — no pool, marking not hit")
+                await write_result(db_id, 0, 0, 0, False)
+                continue
+
+            # 2. OHLCV
+            candles = await get_ohlcv(session, pool_address, token_param)
+            await asyncio.sleep(GT_CALL_DELAY)
+
+            if not candles:
+                logger.warning(f"[{i}/{total}] {mint[:8]} — no candles, marking not hit")
+                await write_result(db_id, 0, 0, 0, False)
+                continue
+
+            # 3. Compute & write
+            entry, peak = compute_prices(candles)
+            if entry <= 0:
+                logger.warning(f"[{i}/{total}] {mint[:8]} — zero entry, marking not hit")
+                await write_result(db_id, 0, 0, 0, False)
+                continue
+
+            multiple = peak / entry if peak > 0 else 0.0
+            hit_2x   = multiple >= 2
+
+            await write_result(db_id, entry, peak, multiple, hit_2x)
+            logger.info(f"[{i}/{total}] {mint[:8]} — entry={entry:.12f} peak={multiple:.2f}x hit_2x={hit_2x}")
+
+    logger.info("[BACKFILL] complete")
+
 
 if __name__ == "__main__":
-    # Run standalone for manual backfill
     asyncio.run(run_backfill())
