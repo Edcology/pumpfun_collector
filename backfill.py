@@ -132,36 +132,42 @@ async def run_backfill():
 
             logger.info(f"[{i}/{total}] processing {mint[:8]}")
 
-            # 1. Pool
-            pool_address, token_param = await get_pool(session, mint)
-            await asyncio.sleep(GT_CALL_DELAY)
+            try:
+                # 1. Pool
+                pool_address, token_param = await get_pool(session, mint)
+                await asyncio.sleep(GT_CALL_DELAY)
 
-            if not pool_address:
-                logger.warning(f"[{i}/{total}] {mint[:8]} — no pool, marking not hit")
-                await write_result(db_id, 0, 0, 0, False)
-                continue
+                if not pool_address:
+                    logger.warning(f"[{i}/{total}] {mint[:8]} — no pool, marking not hit")
+                    await write_result(db_id, 0, 0, 0, False)
+                    continue
 
-            # 2. OHLCV
-            candles = await get_ohlcv(session, pool_address, token_param)
-            await asyncio.sleep(GT_CALL_DELAY)
+                # 2. OHLCV
+                candles = await get_ohlcv(session, pool_address, token_param)
+                await asyncio.sleep(GT_CALL_DELAY)
 
-            if not candles:
-                logger.warning(f"[{i}/{total}] {mint[:8]} — no candles, marking not hit")
-                await write_result(db_id, 0, 0, 0, False)
-                continue
+                if not candles:
+                    logger.warning(f"[{i}/{total}] {mint[:8]} — no candles, marking not hit")
+                    await write_result(db_id, 0, 0, 0, False)
+                    continue
 
-            # 3. Compute & write
-            entry, peak = compute_prices(candles)
-            if entry <= 0:
-                logger.warning(f"[{i}/{total}] {mint[:8]} — zero entry, marking not hit")
-                await write_result(db_id, 0, 0, 0, False)
-                continue
+                # 3. Compute & write
+                entry, peak = compute_prices(candles)
+                if entry <= 0:
+                    logger.warning(f"[{i}/{total}] {mint[:8]} — zero entry, marking not hit")
+                    await write_result(db_id, 0, 0, 0, False)
+                    continue
 
-            multiple = peak / entry if peak > 0 else 0.0
-            hit_2x   = multiple >= 2
+                multiple = peak / entry if peak > 0 else 0.0
+                hit_2x   = multiple >= 2
 
-            await write_result(db_id, entry, peak, multiple, hit_2x)
-            logger.info(f"[{i}/{total}] {mint[:8]} — entry={entry:.12f} peak={multiple:.2f}x hit_2x={hit_2x}")
+                await write_result(db_id, entry, peak, multiple, hit_2x)
+                logger.info(f"[{i}/{total}] {mint[:8]} — entry={entry:.12f} peak={multiple:.2f}x hit_2x={hit_2x}")
+            finally:
+                # Pause for a minute after every 20 tokens processed
+                if i % 20 == 0:
+                    logger.info(f"[BACKFILL] processed {i}/{total} tokens — pausing 60s")
+                    await asyncio.sleep(60)
 
     logger.info("[BACKFILL] complete")
 
